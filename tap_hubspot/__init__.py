@@ -216,11 +216,6 @@ def load_schema(entity_name):
     if entity_name == "deals":
         custom_schema = get_v3_schema(entity_name)
 
-        schema['properties']['properties'] = {
-            "type": "object",
-            "properties": custom_schema,
-        }
-
         # Move properties to top level
         custom_schema_top_level = {'property_{}'.format(k): v for k, v in custom_schema.items()}
         schema['properties'].update(custom_schema_top_level)
@@ -324,6 +319,10 @@ def lift_properties_and_versions_v3(record):
 
     liftedRecord = {}
     liftedRecord["dealId"] = record["dealId"]
+
+    if "associations" in record:
+        liftedRecord["associations"] = record["associations"]
+
     for key, value in record.get('properties', {}).items():
 
         computed_key = "property_{}".format(key)
@@ -428,15 +427,16 @@ def head_100(a_list):
 # This implement both the pagination of v3 and also the ability
 # to "chunks" the properties so that we can limit the URL length when doing calls
 # as the properties are passed in the QS
-def gen_request_v3(STATE, tap_stream_id, url, params, path, custom_properties_chunks=[]):
+def gen_request_v3(STATE, tap_stream_id, url, params, path, custom_properties_chunks=[], associations=[]):
 
+    # Looping on all the pages until we reach the final one
     while True:
 
         if singer.get_offset(STATE, tap_stream_id):
             params.update(singer.get_offset(STATE, tap_stream_id))
 
-        # We have to make 1 call per properties chunk
-        # results will contains the list of all records page (so a list of list)
+        # We are doing 1 API call per properties chunk
+        # Each call will return the same deal page but with a subset of the deal custom properties each time
         results = []
         for property_chunk in custom_properties_chunks:
 
@@ -446,6 +446,15 @@ def gen_request_v3(STATE, tap_stream_id, url, params, path, custom_properties_ch
             data = request(url, params).json()
 
             results.append(data[path])
+
+        # Resetting the "properties" param
+        del params["properties"]
+
+        # Making an API call to fetch the associations for a given page of deals
+        params['associations'] = ",".join(associations)
+        data = request(url, params).json()
+        results.append(data[path])
+        del params["associations"]
 
         # We use a dict to merge together all the properties for a given deal
         # We use the dealId as the dict key
@@ -460,6 +469,10 @@ def gen_request_v3(STATE, tap_stream_id, url, params, path, custom_properties_ch
                 merged_properties = {**records_map[record["id"]]["properties"], **record["properties"]}
                 records_map[record["id"]]["properties"] = merged_properties
 
+                # If we reached the deal record that contains the association info, we take it
+                if "associations" in record:
+                    records_map[record["id"]]["associations"] = record["associations"]
+
                 # Keep the DealId in "dealId" field to preserve the table
                 # primary key that is "dealId" before the switch to v3 API for deals
                 records_map[record["id"]]["dealId"] = record["id"]
@@ -470,7 +483,7 @@ def gen_request_v3(STATE, tap_stream_id, url, params, path, custom_properties_ch
                 counter.increment()
                 yield value
 
-        # This is the paging break signal
+        # This is the paging break signal from Hubspot
         if not "paging" in data:
             break
 
@@ -668,10 +681,12 @@ def sync_deals(STATE, ctx):
 
     property_chunks.append(properties)
 
+    # TODO: Make it configurable through the singer catalog metadata selection pattern
+    associations = ["contacts"]
+
     url = get_url('deals_v3_all')
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        for row in gen_request_v3(STATE, "deals", url, params, "results", custom_properties_chunks=property_chunks):
-            row_properties = row['properties']
+        for row in gen_request_v3(STATE, "deals", url, params, "results", custom_properties_chunks=property_chunks, associations=associations):
             modified_time = None
 
             if 'updatedAt' in row:
